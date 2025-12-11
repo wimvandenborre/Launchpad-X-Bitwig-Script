@@ -14,6 +14,13 @@ import io.github.jengamon.novation.modes.SessionMode;
 import io.github.jengamon.novation.modes.mixer.*;
 import io.github.jengamon.novation.surface.LaunchpadXSurface;
 import io.github.jengamon.novation.surface.state.PadLightState;
+import com.bitwig.extension.api.opensoundcontrol.OscModule;
+import com.bitwig.extension.api.opensoundcontrol.OscAddressSpace;
+import com.bitwig.extension.api.opensoundcontrol.OscConnection;
+import com.bitwig.extension.api.opensoundcontrol.OscMessage;
+import com.bitwig.extension.api.opensoundcontrol.OscMethodCallback;
+
+
 
 import java.io.PrintStream;
 import java.util.ArrayList;
@@ -67,6 +74,10 @@ public class LaunchpadXExtension extends ControllerExtension {
         mSessionTrackBank.setSkipDisabledItems(true);
 
         mViewableBanks.addValueObserver(vb -> mSessionTrackBank.sceneBank().setIndication(vb));
+
+
+        setupBitxOscFollow(host, mSessionTrackBank);
+
 
         mCursorTrack.playingNotes().addValueObserver(new ObjectValueChangedCallback<PlayingNote[]>() {
             // yoinked from the BW script mwahahaha
@@ -346,6 +357,74 @@ public class LaunchpadXExtension extends ControllerExtension {
      */
     private void onMidi1(ShortMidiMessage msg) {
 //       System.out.println("C: " + Utils.toHexString((byte)msg.getStatusByte()) + Utils.toHexString((byte)msg.getData1()) + Utils.toHexString((byte)msg.getData2()));
+    }
+
+    /** OSC server so Launchpad session view can follow BitX JUMPTO. */
+    private void setupBitxOscFollow(ControllerHost host, TrackBank sessionTrackBank) {
+        try {
+            OscModule oscModule = host.getOscModule();
+
+            // Create an address space for our OSC server
+            OscAddressSpace addrSpace = oscModule.createAddressSpace();
+            addrSpace.setName("Launchpad BitX Follow");
+            addrSpace.setShouldLogMessages(false); // set true if you want to see OSC in Bitwig log
+
+            // Handle: /bitx/jumpScene <int sceneIndex>
+            addrSpace.registerMethod(
+                    "/bitx/jumpScene",
+                    "*",                       // accept any arg types; we'll parse ourselves
+                    "Follow BitX JUMPTO scene",
+                    new OscMethodCallback() {
+                        @Override
+                        public void handle(OscConnection connection, OscMessage msg) {
+                            // Debug
+                            host.println("Launchpad OSC: received " +
+                                    msg.getAddressPattern() + " args=" + msg.getArguments());
+
+                            // We expect at least one argument (scene index)
+                            if (msg.getArguments().isEmpty()) {
+                                host.println("Launchpad OSC: /bitx/jumpScene missing index argument.");
+                                return;
+                            }
+
+                            // Try to read index as int; fall back to double if needed
+                            Integer sceneIndexObj = msg.getInt(0);
+                            if (sceneIndexObj == null) {
+                                Double d = msg.getDouble(0);
+                                if (d == null) {
+                                    host.println("Launchpad OSC: /bitx/jumpScene arg[0] not number.");
+                                    return;
+                                }
+                                sceneIndexObj = d.intValue();
+                            }
+
+                            int sceneIndex = sceneIndexObj;
+                            SceneBank sceneBank = sessionTrackBank.sceneBank();
+
+                            int windowSize = sceneBank.getSizeOfBank(); // usually 8
+                            if (windowSize <= 0) windowSize = 8;
+
+                            int page      = sceneIndex / windowSize;
+                            int slotInWin = sceneIndex % windowSize;
+
+                            // Roughly align Launchpad's scene window so this scene is visible
+                            sceneBank.scrollByPages(page);
+                            sceneBank.scrollBy(slotInWin);
+                            sceneBank.scrollIntoView(sceneIndex);
+
+                            host.println("Launchpad OSC: JUMPTO -> scene " + sceneIndex);
+                        }
+                    }
+            );
+
+            // Create the UDP server – PORT MUST MATCH BitX's oscSendPort
+            int port = 9001; // choose one; set BitX's OSC Send Port to the same value
+            oscModule.createUdpServer(port, addrSpace);
+
+            host.println("Launchpad OSC: listening for BitX on UDP port " + port);
+        } catch (Exception ex) {
+            host.println("Launchpad OSC: failed to set up: " + ex.getMessage());
+        }
     }
 
 //   /** Called when we receive sysex MIDI message on port 1. */

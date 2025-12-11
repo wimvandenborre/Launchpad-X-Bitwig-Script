@@ -44,7 +44,7 @@
 						</goals>
 						<configuration>
 							<sourceFile>${project.build.directory}/${project.build.finalName}.jar</sourceFile>
-							<destinationFile>${project.build.directory}/LaunchpadX.bwextension</destinationFile>
+							<destinationFile>/Users/wimvandenborre/Documents/Bitwig Studio/Extensions/LaunchpadX.bwextension</destinationFile>
 						</configuration>
 					</execution>
 				</executions>
@@ -72,8 +72,8 @@
 				<configuration>
 				   <optimize>true</optimize>
 				   <fork>true</fork>
-				   <source>1.8</source>
-				   <target>1.8</target>
+				   <source>8</source>
+				   <target>8</target>
 				   <encoding>UTF-8</encoding>
 				   <maxmem>1024m</maxmem>
 				</configuration>
