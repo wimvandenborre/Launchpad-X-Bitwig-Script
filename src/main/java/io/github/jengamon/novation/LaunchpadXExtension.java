@@ -342,7 +342,7 @@ public class LaunchpadXExtension extends ControllerExtension {
     }
 
     /** OSC server so Launchpad session view can follow BitX JUMPTO. */
-    /** OSC server so Launchpad session view can follow BitX JUMPTO. */
+
     private void setupBitxOscFollow(ControllerHost host, TrackBank sessionTrackBank) {
         try {
             OscModule oscModule = host.getOscModule();
@@ -351,45 +351,27 @@ public class LaunchpadXExtension extends ControllerExtension {
             addrSpace.setName("Launchpad BitX Follow");
             addrSpace.setShouldLogMessages(false);
 
-            addrSpace.registerMethod(
+            // /bitx/jumpScene [trackIndex sceneIndex]
+            registerOscIntCommand(
+                    host,
+                    addrSpace,
                     "/bitx/jumpScene",
-                    "*",
                     "Follow BitX JUMPTO scene",
-                    (connection, msg) -> {
-                        host.println("Launchpad OSC: received " +
-                                msg.getAddressPattern() + " args=" + msg.getArguments());
+                    (connection, args) -> {
+                        int trackIndex;
+                        int sceneIndex;
 
-                        if (msg.getArguments().isEmpty()) {
-                            host.println("Launchpad OSC: /bitx/jumpScene missing arguments.");
-                            return;
-                        }
-
-                        // Helper to extract integer arguments (int / float / double)
-                        java.util.function.IntFunction<Integer> getIntArg = idx -> {
-                            Integer i = msg.getInt(idx);
-                            if (i != null) return i;
-                            Double d = msg.getDouble(idx);
-                            if (d != null) return d.intValue();
-                            Float f = msg.getFloat(idx);
-                            if (f != null) return f.intValue();
-                            return null;
-                        };
-
-                        Integer trackIndex = msg.getArguments().size() >= 2 ? getIntArg.apply(0) : 0;
-                        Integer sceneIndex = msg.getArguments().size() >= 2 ? getIntArg.apply(1) : getIntArg.apply(0);
-
-                        if (sceneIndex == null) {
-                            host.println("Launchpad OSC: sceneIndex not numeric.");
-                            return;
-                        }
-                        if (trackIndex == null) {
-                            host.println("Launchpad OSC: trackIndex not numeric, defaulting to 0.");
+                        if (args.length >= 2) {
+                            trackIndex = args[0];
+                            sceneIndex = args[1];
+                        } else {
                             trackIndex = 0;
+                            sceneIndex = args[0];
                         }
 
                         SceneBank sceneBank = sessionTrackBank.sceneBank();
 
-                        // --- Scroll TRACKS so the target track is visible in the 8-wide TrackBank ---
+                        // --- ensure track visible in TrackBank (8-wide) ---
                         int trackWindowSize = sessionTrackBank.getSizeOfBank(); // usually 8
                         if (trackWindowSize <= 0) trackWindowSize = 8;
 
@@ -397,24 +379,25 @@ public class LaunchpadXExtension extends ControllerExtension {
                                 " visible (TrackBank size=" + trackWindowSize + ")");
                         sessionTrackBank.scrollIntoView(trackIndex);
 
-                        // --- Scroll SCENES so the target scene is visible in the 8-high SceneBank ---
+                        // --- ensure scene visible in SceneBank (8-high) ---
                         int sceneWindowSize = sceneBank.getSizeOfBank(); // usually 8
                         if (sceneWindowSize <= 0) sceneWindowSize = 8;
 
-                        int page     = sceneIndex / sceneWindowSize;
+                        int page      = sceneIndex / sceneWindowSize;
                         int slotInWin = sceneIndex % sceneWindowSize;
 
                         sceneBank.scrollByPages(page);
                         sceneBank.scrollBy(slotInWin);
                         sceneBank.scrollIntoView(sceneIndex);
 
-                        host.println("Launchpad OSC: JUMPTO -> track " + trackIndex + " scene " + sceneIndex);
+                        host.println("Launchpad OSC: JUMPTO -> track " + trackIndex +
+                                " scene " + sceneIndex);
 
-                        // 🔸 Wait ~3 seconds so Bitwig + Launchpad are fully scrolled, then flash just that pad
+                        // Flash pad after short delay so scrolling has settled
                         if (mSessionMode != null) {
-                            host.println("   ⏳ Scheduling pad visual flash in 3s...");
                             int finalTrackIndex = trackIndex;
                             int finalSceneIndex = sceneIndex;
+                            host.println("   ⏳ Scheduling pad visual flash in 300ms...");
                             host.scheduleTask(() -> {
                                 host.println("   ⚡ Executing pad visual flash for track " +
                                         finalTrackIndex + " scene " + finalSceneIndex);
@@ -426,7 +409,7 @@ public class LaunchpadXExtension extends ControllerExtension {
 
             int port = (int) oscReceivePortSetting.getRaw();
             if (port < 1024 || port > 65535) {
-                port = 9001;
+                port = 8000;
             }
 
             oscModule.createUdpServer(port, addrSpace);
@@ -437,5 +420,60 @@ public class LaunchpadXExtension extends ControllerExtension {
             host.println("Launchpad OSC: failed to set up: " + ex.getMessage());
         }
     }
+
+
+    @FunctionalInterface
+    private interface OscIntHandler {
+        void handle(OscConnection connection, int[] args);
+    }
+
+    private void registerOscIntCommand(
+            ControllerHost host,
+            OscAddressSpace addrSpace,
+            String address,
+            String description,
+            OscIntHandler handler
+    ) {
+        addrSpace.registerMethod(
+                address,
+                "*",              // accept any types, we'll coerce to int
+                description,
+                (connection, msg) -> {
+                    host.println("Launchpad OSC: received " +
+                            msg.getAddressPattern() + " args=" + msg.getArguments());
+
+                    if (msg.getArguments().isEmpty()) {
+                        host.println("Launchpad OSC: " + address + " missing arguments.");
+                        return;
+                    }
+
+                    int argCount = msg.getArguments().size();
+                    int[] ints = new int[argCount];
+
+                    for (int i = 0; i < argCount; i++) {
+                        Integer v = msg.getInt(i);
+                        if (v == null) {
+                            Double d = msg.getDouble(i);
+                            if (d != null) v = d.intValue();
+                        }
+                        if (v == null) {
+                            Float f = msg.getFloat(i);
+                            if (f != null) v = f.intValue();
+                        }
+
+                        if (v == null) {
+                            host.println("Launchpad OSC: " + address +
+                                    " arg[" + i + "] is not numeric → aborting.");
+                            return;
+                        }
+                        ints[i] = v;
+                    }
+
+                    // Hand off to our high-level handler
+                    handler.handle(connection, ints);
+                }
+        );
+    }
+
 
 }
