@@ -1,3 +1,5 @@
+// LaunchpadXExtension.java
+
 package io.github.jengamon.novation;
 
 import com.bitwig.extension.api.util.midi.ShortMidiMessage;
@@ -20,8 +22,6 @@ import com.bitwig.extension.api.opensoundcontrol.OscConnection;
 import com.bitwig.extension.api.opensoundcontrol.OscMessage;
 import com.bitwig.extension.api.opensoundcontrol.OscMethodCallback;
 
-
-
 import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.List;
@@ -34,11 +34,17 @@ public class LaunchpadXExtension extends ControllerExtension {
     private LaunchpadXSurface mLSurface;
     private ModeMachine mMachine;
 
+    // We keep a reference so OSC handler can ask it to flash a scene row
+    private SessionMode mSessionMode;
+
     private final static String CLIP_LAUNCHER = "Clip Launcher";
     private final static String GLOBAL = "Global";
     private final static String TOGGLE_RECORD = "Toggle Record";
     private final static String CYCLE_TRACKS = "Cycle Tracks";
     private final static String LAUNCH_ALT = "Launch Alt";
+
+    private SettableStringValue oscReceiveIpSetting;
+    private SettableRangedValue oscReceivePortSetting;
 
     protected LaunchpadXExtension(final LaunchpadXExtensionDefinition definition, final ControllerHost host) {
         super(definition, host);
@@ -52,64 +58,64 @@ public class LaunchpadXExtension extends ControllerExtension {
         DocumentState documentPrefs = host.getDocumentState();
         BooleanValue mSwapOnBoot = prefs.getBooleanSetting("Swap to Session on Boot?", "Behavior", true);
         BooleanValue mPulseSessionPads = prefs.getBooleanSetting("Pulse Session Scene Pads?", "Behavior", false);
-//      BooleanValue mFollowCursorTrack = prefs.getBooleanSetting("Follow Cursor Track?", "Behavior", true);
         BooleanValue mViewableBanks = prefs.getBooleanSetting("Viewable Bank?", "Behavior", true);
         BooleanValue mStopClipsBeforeToggle = prefs.getBooleanSetting("Stop Recording Clips before Toggle Record?", "Record Button", false);
 
         EnumValue mRecordLevel = documentPrefs.getEnumSetting("Rec. Target", "Record Button", new String[]{GLOBAL, CLIP_LAUNCHER}, CLIP_LAUNCHER);
         EnumValue mRecordAction = documentPrefs.getEnumSetting("Action", "Record Button", new String[]{TOGGLE_RECORD, CYCLE_TRACKS, LAUNCH_ALT}, TOGGLE_RECORD);
 
-        // Replace System.out and System.err with ones that should actually work
+        oscReceiveIpSetting = prefs.getStringSetting("Osc Receive IP", "OSC", 15, "127.0.0.1");
+        oscReceivePortSetting = prefs.getNumberSetting("Osc Receive Port", "OSC", 1024, 65535, 1, "", 8000);
+
+        // Replace System.out and System.err with ones that actually log in Bitwig
         System.setOut(new PrintStream(new HostOutputStream(host)));
         System.setErr(new PrintStream(new HostErrorOutputStream(host)));
 
-        // Create the requisite state objects
+        // Create state objects
         mSession = new Session(host);
         mSurface = host.createHardwareSurface();
         Transport mTransport = host.createTransport();
         CursorTrack mCursorTrack = host.createCursorTrack(8, 0);
-        CursorDevice mCursorDevice = mCursorTrack.createCursorDevice("Primary", "Primary Instrument", 0, CursorDeviceFollowMode.FIRST_INSTRUMENT);
-        CursorDevice mControlsCursorDevice = mCursorTrack.createCursorDevice("Primary IoE", "Primary Device", 0, CursorDeviceFollowMode.FOLLOW_SELECTION);
+        CursorDevice mCursorDevice = mCursorTrack.createCursorDevice(
+                "Primary", "Primary Instrument", 0, CursorDeviceFollowMode.FIRST_INSTRUMENT);
+        CursorDevice mControlsCursorDevice = mCursorTrack.createCursorDevice(
+                "Primary IoE", "Primary Device", 0, CursorDeviceFollowMode.FOLLOW_SELECTION);
         TrackBank mSessionTrackBank = host.createTrackBank(8, 0, 8, true);
         mSessionTrackBank.setSkipDisabledItems(true);
 
         mViewableBanks.addValueObserver(vb -> mSessionTrackBank.sceneBank().setIndication(vb));
 
-
+        // --- OSC FOLLOW SETUP ---
         setupBitxOscFollow(host, mSessionTrackBank);
 
-
         mCursorTrack.playingNotes().addValueObserver(new ObjectValueChangedCallback<PlayingNote[]>() {
-            // yoinked from the BW script mwahahaha
             @Override
             public void valueChanged(PlayingNote[] playingNotes) {
                 for (int pitch : mPrevPitches) {
                     mSession.midiOut(ChannelType.DAW).sendMidi(0x8f, pitch, 0);
                 }
-
                 mPrevPitches.clear();
-
                 for (PlayingNote playingNote : playingNotes) {
                     mSession.midiOut(ChannelType.DAW).sendMidi(0x9f, playingNote.pitch(), 21);
                     mPrevPitches.add(playingNote.pitch());
                 }
             }
-
             final ArrayList<Integer> mPrevPitches = new ArrayList<>();
         });
 
-        // Create surface buttons and their lights
+        // Create surface & mode machine
         mSurface.setPhysicalSize(241, 241);
         mLSurface = new LaunchpadXSurface(host, mSession, mSurface);
         mMachine = new ModeMachine(mSession);
 
-
-        // Setup "launchAlt" var
         AtomicBoolean launchAlt = new AtomicBoolean(false);
         AtomicBoolean launchAltConfig = new AtomicBoolean(false);
 
-        // Session modes
-        mMachine.register(Mode.SESSION, new SessionMode(mSessionTrackBank, mTransport, mLSurface, host, mPulseSessionPads, launchAlt));
+        // --- SESSION MODE (keep reference in mSessionMode) ---
+        mSessionMode = new SessionMode(mSessionTrackBank, mTransport, mLSurface, host, mPulseSessionPads, launchAlt);
+        mMachine.register(Mode.SESSION, mSessionMode);
+
+        // Drum & mixer modes unchanged...
         mMachine.register(Mode.DRUM, new DrumPadMode(host, mSession, mLSurface, mCursorDevice));
         mMachine.register(Mode.UNKNOWN, new AbstractMode() {
             @Override
@@ -117,7 +123,7 @@ public class LaunchpadXExtension extends ControllerExtension {
                 return new ArrayList<>();
             }
         });
-        // Mixer modes
+
         AtomicReference<Mode> mixerMode = new AtomicReference<>(Mode.MIXER_VOLUME);
         mMachine.register(Mode.MIXER_VOLUME, new VolumeMixer(mixerMode, host, mTransport, mLSurface, mSessionTrackBank));
         mMachine.register(Mode.MIXER_PAN, new PanMixer(mixerMode, host, mTransport, mLSurface, mSessionTrackBank));
@@ -127,7 +133,8 @@ public class LaunchpadXExtension extends ControllerExtension {
         mMachine.register(Mode.MIXER_MUTE, new MuteMixer(mixerMode, host, mTransport, mLSurface, mSessionTrackBank, launchAlt));
         mMachine.register(Mode.MIXER_SOLO, new SoloMixer(mixerMode, host, mTransport, mLSurface, mSessionTrackBank, launchAlt));
         mMachine.register(Mode.MIXER_ARM, new RecordArmMixer(mixerMode, host, mTransport, mLSurface, mSessionTrackBank, launchAlt));
-        // Select record button behavior and light it accordingly
+
+        // Record button behaviour (unchanged – your existing code)
         mCursorTrack.hasNext().markInterested();
         AtomicBoolean recordActionToggle = new AtomicBoolean(false);
         AtomicBoolean recordLevelGlobal = new AtomicBoolean(false);
@@ -162,7 +169,6 @@ public class LaunchpadXExtension extends ControllerExtension {
                                 break;
                             }
                         }
-
                         if (targetSlot >= 0) {
                             clipStopped = true;
                             bank.stop();
@@ -171,7 +177,6 @@ public class LaunchpadXExtension extends ControllerExtension {
                     }
                 }
 
-                // Only toggle the record button if we *didn't* stop any clips.
                 if (!clipStopped) {
                     if (recordLevelGlobal.get()) {
                         mTransport.isArrangerRecordEnabled().toggle();
@@ -180,7 +185,6 @@ public class LaunchpadXExtension extends ControllerExtension {
                     }
                 }
             } else if (!launchAltConfig.get()) {
-                // if we *aren't* configured to alt launch
                 if (mCursorTrack.hasNext().get()) {
                     mCursorTrack.selectNext();
                 } else {
@@ -208,50 +212,37 @@ public class LaunchpadXExtension extends ControllerExtension {
         BooleanValue clipLauncherOverdub = mTransport.isClipLauncherOverdubEnabled();
         mRecordLevel.addValueObserver(
                 target -> {
-                    if(recordActionToggle.get()) {
+                    if (recordActionToggle.get()) {
                         if (target.equals(GLOBAL)) {
-                            if (arrangerRecord.get()) {
-                                recordLight.state().setValue(PadLightState.solidLight(5));
-                            } else {
-                                recordLight.state().setValue(PadLightState.solidLight(7));
-                            }
+                            recordLight.state().setValue(
+                                    arrangerRecord.get() ? PadLightState.solidLight(5) : PadLightState.solidLight(7)
+                            );
                         } else if (target.equals(CLIP_LAUNCHER)) {
-                            if (clipLauncherOverdub.get()) {
-                                recordLight.state().setValue(PadLightState.solidLight(5));
-                            } else {
-                                recordLight.state().setValue(PadLightState.solidLight(7));
-                            }
+                            recordLight.state().setValue(
+                                    clipLauncherOverdub.get() ? PadLightState.solidLight(5) : PadLightState.solidLight(7)
+                            );
                         }
                     }
                 }
         );
         arrangerRecord.addValueObserver(are -> {
             if (recordActionToggle.get() && mRecordLevel.get().equals(GLOBAL)) {
-                if (are) {
-                    recordLight.state().setValue(PadLightState.solidLight(5));
-                } else {
-                    recordLight.state().setValue(PadLightState.solidLight(7));
-                }
+                recordLight.state().setValue(are ? PadLightState.solidLight(5) : PadLightState.solidLight(7));
             }
         });
         clipLauncherOverdub.addValueObserver(ode -> {
             if (recordActionToggle.get() && mRecordLevel.get().equals(CLIP_LAUNCHER)) {
-                if (ode) {
-                    recordLight.state().setValue(PadLightState.solidLight(5));
-                } else {
-                    recordLight.state().setValue(PadLightState.solidLight(7));
-                }
+                recordLight.state().setValue(ode ? PadLightState.solidLight(5) : PadLightState.solidLight(7));
             }
         });
         mRecordAction.addValueObserver(val -> {
             if (val.equals(CYCLE_TRACKS)) {
-                // cycle tracks lighting
                 recordLight.state().setValue(PadLightState.solidLight(13));
             } else if (val.equals(LAUNCH_ALT)) {
                 recordLight.state().setValue(PadLightState.solidLight(3));
             } else {
-                // Record action
-                if ((arrangerRecord.get() && mRecordLevel.get().equals(GLOBAL)) || (clipLauncherOverdub.get() && mRecordLevel.get().equals(CLIP_LAUNCHER))) {
+                if ((arrangerRecord.get() && mRecordLevel.get().equals(GLOBAL))
+                        || (clipLauncherOverdub.get() && mRecordLevel.get().equals(CLIP_LAUNCHER))) {
                     recordLight.state().setValue(PadLightState.solidLight(5));
                 } else {
                     recordLight.state().setValue(PadLightState.solidLight(7));
@@ -261,7 +252,9 @@ public class LaunchpadXExtension extends ControllerExtension {
 
         mLSurface.novation().light().state().setValue(PadLightState.solidLight(3));
 
+        //AtomicReference<Mode> mixerMode = new AtomicReference<>(Mode.MIXER_VOLUME);
         AtomicReference<Mode> lastSessionMode = new AtomicReference<>(Mode.SESSION);
+
         HardwareActionBindable mSessionAction = host.createAction(() -> {
             switch (mMachine.mode()) {
                 case SESSION:
@@ -320,7 +313,6 @@ public class LaunchpadXExtension extends ControllerExtension {
         mSession.setMidiCallback(ChannelType.CUSTOM, this::onMidi1);
 
         System.out.println("Launchpad X Initialized");
-
         host.requestFlush();
     }
 
@@ -335,100 +327,115 @@ public class LaunchpadXExtension extends ControllerExtension {
         mSurface.updateHardware();
     }
 
-    /**
-     * Called when we receive short MIDI message on port 0.
-     */
     private void onMidi0(ShortMidiMessage msg) {
-//      mSurface.invalidateHardwareOutputState();
-//      System.out.println(msg);
+        // no-op
     }
 
-    /**
-     * Called when we receive sysex MIDI message on port 0.
-     */
     private void onSysex0(final String data) {
         byte[] sysex = Utils.parseSysex(data);
         mMachine.sendSysex(sysex);
         mSurface.invalidateHardwareOutputState();
     }
 
-    /**
-     * Called when we receive short MIDI message on port 1.
-     */
     private void onMidi1(ShortMidiMessage msg) {
-//       System.out.println("C: " + Utils.toHexString((byte)msg.getStatusByte()) + Utils.toHexString((byte)msg.getData1()) + Utils.toHexString((byte)msg.getData2()));
+        // no-op
     }
 
+    /** OSC server so Launchpad session view can follow BitX JUMPTO. */
     /** OSC server so Launchpad session view can follow BitX JUMPTO. */
     private void setupBitxOscFollow(ControllerHost host, TrackBank sessionTrackBank) {
         try {
             OscModule oscModule = host.getOscModule();
 
-            // Create an address space for our OSC server
             OscAddressSpace addrSpace = oscModule.createAddressSpace();
             addrSpace.setName("Launchpad BitX Follow");
-            addrSpace.setShouldLogMessages(false); // set true if you want to see OSC in Bitwig log
+            addrSpace.setShouldLogMessages(false);
 
-            // Handle: /bitx/jumpScene <int sceneIndex>
             addrSpace.registerMethod(
                     "/bitx/jumpScene",
-                    "*",                       // accept any arg types; we'll parse ourselves
+                    "*",
                     "Follow BitX JUMPTO scene",
-                    new OscMethodCallback() {
-                        @Override
-                        public void handle(OscConnection connection, OscMessage msg) {
-                            // Debug
-                            host.println("Launchpad OSC: received " +
-                                    msg.getAddressPattern() + " args=" + msg.getArguments());
+                    (connection, msg) -> {
+                        host.println("Launchpad OSC: received " +
+                                msg.getAddressPattern() + " args=" + msg.getArguments());
 
-                            // We expect at least one argument (scene index)
-                            if (msg.getArguments().isEmpty()) {
-                                host.println("Launchpad OSC: /bitx/jumpScene missing index argument.");
-                                return;
-                            }
+                        if (msg.getArguments().isEmpty()) {
+                            host.println("Launchpad OSC: /bitx/jumpScene missing arguments.");
+                            return;
+                        }
 
-                            // Try to read index as int; fall back to double if needed
-                            Integer sceneIndexObj = msg.getInt(0);
-                            if (sceneIndexObj == null) {
-                                Double d = msg.getDouble(0);
-                                if (d == null) {
-                                    host.println("Launchpad OSC: /bitx/jumpScene arg[0] not number.");
-                                    return;
-                                }
-                                sceneIndexObj = d.intValue();
-                            }
+                        // Helper to extract integer arguments (int / float / double)
+                        java.util.function.IntFunction<Integer> getIntArg = idx -> {
+                            Integer i = msg.getInt(idx);
+                            if (i != null) return i;
+                            Double d = msg.getDouble(idx);
+                            if (d != null) return d.intValue();
+                            Float f = msg.getFloat(idx);
+                            if (f != null) return f.intValue();
+                            return null;
+                        };
 
-                            int sceneIndex = sceneIndexObj;
-                            SceneBank sceneBank = sessionTrackBank.sceneBank();
+                        Integer trackIndex = msg.getArguments().size() >= 2 ? getIntArg.apply(0) : 0;
+                        Integer sceneIndex = msg.getArguments().size() >= 2 ? getIntArg.apply(1) : getIntArg.apply(0);
 
-                            int windowSize = sceneBank.getSizeOfBank(); // usually 8
-                            if (windowSize <= 0) windowSize = 8;
+                        if (sceneIndex == null) {
+                            host.println("Launchpad OSC: sceneIndex not numeric.");
+                            return;
+                        }
+                        if (trackIndex == null) {
+                            host.println("Launchpad OSC: trackIndex not numeric, defaulting to 0.");
+                            trackIndex = 0;
+                        }
 
-                            int page      = sceneIndex / windowSize;
-                            int slotInWin = sceneIndex % windowSize;
+                        SceneBank sceneBank = sessionTrackBank.sceneBank();
 
-                            // Roughly align Launchpad's scene window so this scene is visible
-                            sceneBank.scrollByPages(page);
-                            sceneBank.scrollBy(slotInWin);
-                            sceneBank.scrollIntoView(sceneIndex);
+                        // --- Scroll TRACKS so the target track is visible in the 8-wide TrackBank ---
+                        int trackWindowSize = sessionTrackBank.getSizeOfBank(); // usually 8
+                        if (trackWindowSize <= 0) trackWindowSize = 8;
 
-                            host.println("Launchpad OSC: JUMPTO -> scene " + sceneIndex);
+                        host.println("Launchpad OSC: ensuring track " + trackIndex +
+                                " visible (TrackBank size=" + trackWindowSize + ")");
+                        sessionTrackBank.scrollIntoView(trackIndex);
+
+                        // --- Scroll SCENES so the target scene is visible in the 8-high SceneBank ---
+                        int sceneWindowSize = sceneBank.getSizeOfBank(); // usually 8
+                        if (sceneWindowSize <= 0) sceneWindowSize = 8;
+
+                        int page     = sceneIndex / sceneWindowSize;
+                        int slotInWin = sceneIndex % sceneWindowSize;
+
+                        sceneBank.scrollByPages(page);
+                        sceneBank.scrollBy(slotInWin);
+                        sceneBank.scrollIntoView(sceneIndex);
+
+                        host.println("Launchpad OSC: JUMPTO -> track " + trackIndex + " scene " + sceneIndex);
+
+                        // 🔸 Wait ~3 seconds so Bitwig + Launchpad are fully scrolled, then flash just that pad
+                        if (mSessionMode != null) {
+                            host.println("   ⏳ Scheduling pad visual flash in 3s...");
+                            int finalTrackIndex = trackIndex;
+                            int finalSceneIndex = sceneIndex;
+                            host.scheduleTask(() -> {
+                                host.println("   ⚡ Executing pad visual flash for track " +
+                                        finalTrackIndex + " scene " + finalSceneIndex);
+                                mSessionMode.flashPadFromGlobalVisual(finalTrackIndex, finalSceneIndex);
+                            }, 300);
                         }
                     }
             );
 
-            // Create the UDP server – PORT MUST MATCH BitX's oscSendPort
-            int port = 9001; // choose one; set BitX's OSC Send Port to the same value
-            oscModule.createUdpServer(port, addrSpace);
+            int port = (int) oscReceivePortSetting.getRaw();
+            if (port < 1024 || port > 65535) {
+                port = 9001;
+            }
 
-            host.println("Launchpad OSC: listening for BitX on UDP port " + port);
+            oscModule.createUdpServer(port, addrSpace);
+            host.println("Launchpad OSC: listening for BitX on UDP port " +
+                    port + " (expecting from " + oscReceiveIpSetting.get() + ")");
+
         } catch (Exception ex) {
             host.println("Launchpad OSC: failed to set up: " + ex.getMessage());
         }
     }
 
-//   /** Called when we receive sysex MIDI message on port 1. */
-//   private void onSysex1(final String data)
-//   {
-//   }
 }

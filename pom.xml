@@ -44,7 +44,7 @@
 						</goals>
 						<configuration>
 							<sourceFile>${project.build.directory}/${project.build.finalName}.jar</sourceFile>
-							<destinationFile>/Users/wimvandenborre/Documents/Bitwig Studio/Extensions/LaunchpadX.bwextension</destinationFile>
+							<destinationFile>${project.build.directory}/LaunchpadX.bwextension</destinationFile>
 						</configuration>
 					</execution>
 				</executions>
